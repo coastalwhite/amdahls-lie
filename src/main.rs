@@ -61,6 +61,9 @@ fn main() {
         "single" => {
             amdahls_lie::single_thread(set, orders, config);
         }
+        "batch" => {
+            amdahls_lie::batched_thread(set, orders, config);
+        }
         "multi" => {
             amdahls_lie::multi_thread(set, orders, config);
         }

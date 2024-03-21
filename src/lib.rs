@@ -26,12 +26,13 @@ fn order_loop(set: &[u8], prime: usize, mask: usize) -> u8 {
 
     // let mut stdout = stdout().lock();
 
-    for _ in 0..mask + 1 {
+    for _ in 0..100 {
         sum = sum.wrapping_add(set[offset & mask]);
+        sum = sum.wrapping_add(set[offset+512 & mask]);
+        sum = sum.wrapping_add(set[offset+1024 & mask]);
+        sum = sum.wrapping_add(set[offset+1536 & mask]);
 
-        // offset *= 279 mod (mask + 1)
-        //               2**8            2**4 +          2**2 +          2**1 +          2**0 = 23
-        offset = (offset << 8) + (offset << 4) + (offset << 2) + (offset << 1) + (offset << 0);
+        offset *= 791;
         offset &= mask;
     }
 
@@ -47,6 +48,35 @@ pub fn single_thread(set: &'static [u8], orders: &[Order], cfg: Config) -> Vec<u
         let section_start = order.section * cfg.num_bytes_per_thread;
         let sum = order_loop(&set[section_start..], order.prime, mask);
         sums.push(sum);
+    }
+
+    sums
+}
+
+pub fn batched_thread(set: &'static [u8], orders: &[Order], cfg: Config) -> Vec<u8> {
+    let mask = (cfg.num_bytes_per_thread.next_power_of_two() >> 1) - 1;
+
+    let mut vec_of_sums: Vec<Vec<u8>> = vec![Vec::with_capacity(orders.len()); cfg.num_threads];
+
+    for thread in 0..cfg.num_threads {
+        for order in orders {
+            if order.section != thread {
+                continue;
+            }
+
+            let section_start = order.section * cfg.num_bytes_per_thread;
+            let sum = order_loop(&set[section_start..], order.prime, mask);
+            vec_of_sums[thread].push(sum);
+        }
+    }
+
+    let mut idxs = vec![0usize; cfg.num_threads];
+    let mut sums = Vec::with_capacity(orders.len());
+
+    for order in orders {
+        let idx = idxs[order.section];
+        sums.push(vec_of_sums[order.section][idx]);
+        idxs[order.section] += 1;
     }
 
     sums
@@ -185,8 +215,8 @@ fn equality() {
     let set = data_set();
     let orders = orders();
 
-    let single = single_thread(set, &orders);
-    let multi = multi_thread(set, &orders);
+    let single = single_thread(set, &orders, config());
+    let multi = multi_thread(set, &orders, config());
 
     assert_eq!(single, multi);
 }
