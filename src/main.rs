@@ -8,24 +8,33 @@ static PRIMES: [usize; 100] = [
     431, 433, 439, 443, 449, 457, 461, 463, 467, 479, 487, 491, 499, 503, 509, 521, 523, 541,
 ];
 
-fn main() {
-    use rand::prelude::*;
-    use rand_chacha::ChaCha8Rng;
-
+fn take_args() -> Option<(String, Config, usize)> {
     let mut args = std::env::args();
 
     args.next().unwrap();
 
-    let subtask = args.next().unwrap();
-    let num_bytes_per_thread: usize = args.next().unwrap().parse().unwrap();
-    let num_threads: usize = args.next().unwrap().parse().unwrap();
-    let num_iterations: usize = args.next().unwrap().parse().unwrap(); 
-    let num_orders: usize = args.next().unwrap().parse().unwrap(); 
+    let subtask = args.next()?;
+    let num_bytes_per_thread: usize = args.next()?.parse().expect("Invalid num_bytes_per_thread");
+    let num_threads: usize = args.next()?.parse().expect("Invalid num_threads");
+    let num_iterations: usize = args.next()?.parse().expect("Invalid num_iterations"); 
+    let num_orders: usize = args.next()?.parse().expect("Invalid num_orders"); 
 
     let config = Config {
         num_bytes_per_thread,
         num_threads,
         num_iterations,
+    };
+
+    Some((subtask, config, num_orders))
+}
+
+fn main() {
+    use rand::prelude::*;
+    use rand_chacha::ChaCha8Rng;
+
+    let Some((subtask, config, num_orders)) = take_args() else {
+        eprintln!("Usage: amdahls_lie <single/multi> <num_bytes_per_thread> <num_threads> <num_iterations> <num_orders>");
+        std::process::exit(2);
     };
 
     let mut rng = ChaCha8Rng::seed_from_u64(0x1337);

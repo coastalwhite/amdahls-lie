@@ -20,26 +20,19 @@ impl Config {
 }
 
 #[inline(never)]
-fn order_loop(set: &[u8], prime: usize, mask: usize, num_iterations: usize) -> u8 {
-    let mut offset = 0usize;
+fn order_loop(set: &[u8], prime: usize, mask: usize) -> u8 {
+    let mut offset = prime;
     let mut sum = 0u8;
-    
+
     // let mut stdout = stdout().lock();
 
-    for _ in 0..num_iterations {
-        let value = set[offset & mask];
+    for _ in 0..mask + 1 {
+        sum = sum.wrapping_add(set[offset & mask]);
 
-        // use std::io::Write;
-        //
-        // writeln!(stdout, "offset = {offset}").unwrap();
-        // writeln!(stdout, "value = {value}").unwrap();
-        //
-        sum = sum.wrapping_add(value);
-
-        // Prevent simple prefetching algorithms from detecting the access pattern
-        offset = offset.wrapping_add(prime);
-        offset = offset.rotate_left(3) ^ 0xF;
-        offset = offset.wrapping_add(0x4242_1337);
+        // offset *= 279 mod (mask + 1)
+        //               2**8            2**4 +          2**2 +          2**1 +          2**0 = 23
+        offset = (offset << 8) + (offset << 4) + (offset << 2) + (offset << 1) + (offset << 0);
+        offset &= mask;
     }
 
     sum
@@ -52,7 +45,7 @@ pub fn single_thread(set: &'static [u8], orders: &[Order], cfg: Config) -> Vec<u
 
     for order in orders {
         let section_start = order.section * cfg.num_bytes_per_thread;
-        let sum = order_loop(&set[section_start..], order.prime, mask, cfg.num_iterations);
+        let sum = order_loop(&set[section_start..], order.prime, mask);
         sums.push(sum);
     }
 
@@ -60,10 +53,10 @@ pub fn single_thread(set: &'static [u8], orders: &[Order], cfg: Config) -> Vec<u
 }
 
 pub fn multi_thread(set: &'static [u8], orders: &[Order], cfg: Config) -> Vec<u8> {
-    let mut queues: Vec<Vec<(usize, usize)>> = vec![Vec::default(); cfg.num_threads];
+    let mut queues: Vec<Vec<usize>> = vec![Vec::default(); cfg.num_threads];
 
-    for (order_idx, order) in orders.iter().enumerate().rev() {
-        queues[order.section].push((order_idx, order.prime));
+    for order in orders.iter() {
+        queues[order.section].push(order.prime);
     }
 
     let mut handles = Vec::with_capacity(cfg.num_threads);
@@ -77,24 +70,31 @@ pub fn multi_thread(set: &'static [u8], orders: &[Order], cfg: Config) -> Vec<u8
 
             let pool_data_set = &set[start..end];
 
-            queue
-                .into_iter()
-                .map(|(order_idx, prime)| {
-                    let sum = order_loop(pool_data_set, prime, mask, cfg.num_iterations);
-                    (order_idx, sum)
-                })
-                .collect::<Vec<(usize, u8)>>()
+            let mut sums: Vec<u8> = Vec::with_capacity(queue.len());
+
+            for prime in queue.into_iter() {
+                let sum = order_loop(pool_data_set, prime, mask);
+                sums.push(sum);
+            }
+
+            sums
         }));
     }
 
-    let mut sums = Vec::with_capacity(orders.len());
+    let mut vec_of_sums = Vec::with_capacity(cfg.num_threads);
 
     for handle in handles.into_iter() {
-        sums.extend_from_slice(&handle.join().unwrap());
+        vec_of_sums.push(handle.join().unwrap());
     }
 
-    sums.sort_by_key(|(idx, _)| *idx);
-    let sums = sums.into_iter().map(|(_, v)| v).collect();
+    let mut idxs = vec![0usize; cfg.num_threads];
+    let mut sums = Vec::with_capacity(orders.len());
+
+    for order in orders {
+        let idx = idxs[order.section];
+        sums.push(vec_of_sums[order.section][idx]);
+        idxs[order.section] += 1;
+    }
 
     sums
 }
