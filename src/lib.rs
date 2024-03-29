@@ -1,37 +1,48 @@
-use std::io::stdout;
-use std::sync::mpsc::channel;
-
 #[derive(Clone, Copy)]
 pub struct Config {
-    pub num_bytes_per_thread: usize,
-    pub num_threads: usize,
-    pub num_iterations: usize,
+    pub num_bytes_per_section: usize,
+    pub num_sections: usize,
 }
 
-pub struct Order {
-    pub prime: usize,
+pub struct Request {
+    pub start: usize,
     pub section: usize,
 }
 
 impl Config {
     pub fn total_bytes(self) -> usize {
-        self.num_bytes_per_thread * self.num_threads
+        self.num_bytes_per_section * self.num_sections
     }
 }
 
 #[inline(never)]
-fn order_loop(set: &[u8], prime: usize, mask: usize) -> u8 {
-    let mut offset = prime;
+fn handle_request(set: &[u8], start: usize, mask: usize) -> u8 {
+    let mut offset = start;
     let mut sum = 0u8;
 
-    // let mut stdout = stdout().lock();
+    const ITERATIONS: usize = 0x100;
+    const LOAD_SPACING: usize = 0x200;
 
-    for _ in 0..100 {
-        sum = sum.wrapping_add(set[offset & mask]);
-        sum = sum.wrapping_add(set[offset+512 & mask]);
-        sum = sum.wrapping_add(set[offset+1024 & mask]);
-        sum = sum.wrapping_add(set[offset+1536 & mask]);
+    for _ in 0..ITERATIONS {
+        // Two Notes:
+        // 1. We load here multiple times to increase the memory burden per loop. Especially with
+        //    the multiplication. This is important.
+        // 2. We space out the loads a bit further so that one request will probably not
+        //    immediately cache the others (L1 cache-line sizes are usually not that big).
+        let v1 = set[(offset + 0 * LOAD_SPACING) & mask];
+        let v2 = set[(offset + 1 * LOAD_SPACING) & mask];
+        let v3 = set[(offset + 2 * LOAD_SPACING) & mask];
+        let v4 = set[(offset + 3 * LOAD_SPACING) & mask];
 
+        sum = sum.wrapping_add(v1);
+        sum = sum.wrapping_add(v2);
+        sum = sum.wrapping_add(v3);
+        sum = sum.wrapping_add(v4);
+
+        // Multiplication, as opposed to addition, to make the memory accesses less predictable.
+        //
+        // For predictable memory accesses, the core detects the pattern and starts prefetching
+        // memory.
         offset *= 791;
         offset &= mask;
     }
@@ -39,71 +50,87 @@ fn order_loop(set: &[u8], prime: usize, mask: usize) -> u8 {
     sum
 }
 
-pub fn single_thread(set: &'static [u8], orders: &[Order], cfg: Config) -> Vec<u8> {
-    let mut sums = Vec::with_capacity(orders.len());
+/// Gives a bitmask that will restrict a number to at most `n`.
+///
+/// The bitmask might not produce the range `0` to `n` but will produce a range `0` to `m` with `m
+/// <= n`
+fn num_to_bitmask(n: usize) -> usize {
+    if n.is_power_of_two() {
+        n - 1
+    } else {
+        (n.next_power_of_two() >> 1) - 1
+    }
+}
 
-    let mask = (cfg.num_bytes_per_thread.next_power_of_two() >> 1) - 1;
+/// Handle all requests on a single thread in order of the requests
+pub fn singlethreaded(set: &'static [u8], requests: &[Request], cfg: Config) -> Vec<u8> {
+    let mut sums = Vec::with_capacity(requests.len());
 
-    for order in orders {
-        let section_start = order.section * cfg.num_bytes_per_thread;
-        let sum = order_loop(&set[section_start..], order.prime, mask);
+    let mask = num_to_bitmask(cfg.num_bytes_per_section);
+
+    for rq in requests {
+        let start = rq.start;
+        let section_start = rq.section * cfg.num_bytes_per_section;
+        let sum = handle_request(&set[section_start..], start, mask);
         sums.push(sum);
     }
 
     sums
 }
 
-pub fn batched_thread(set: &'static [u8], orders: &[Order], cfg: Config) -> Vec<u8> {
-    let mask = (cfg.num_bytes_per_thread.next_power_of_two() >> 1) - 1;
+/// Handle all requests on a single thread batched by the request section
+pub fn singlethreaded_batched(set: &'static [u8], requests: &[Request], cfg: Config) -> Vec<u8> {
+    let mask = num_to_bitmask(cfg.num_bytes_per_section);
 
-    let mut vec_of_sums: Vec<Vec<u8>> = vec![Vec::with_capacity(orders.len()); cfg.num_threads];
+    let mut vec_of_sums: Vec<Vec<u8>> = vec![Vec::with_capacity(requests.len()); cfg.num_sections];
 
-    for thread in 0..cfg.num_threads {
-        for order in orders {
-            if order.section != thread {
+    for thread in 0..cfg.num_sections {
+        for rq in requests {
+            if rq.section != thread {
                 continue;
             }
 
-            let section_start = order.section * cfg.num_bytes_per_thread;
-            let sum = order_loop(&set[section_start..], order.prime, mask);
+            let start = rq.start;
+            let section_start = rq.section * cfg.num_bytes_per_section;
+            let sum = handle_request(&set[section_start..], start, mask);
             vec_of_sums[thread].push(sum);
         }
     }
 
-    let mut idxs = vec![0usize; cfg.num_threads];
-    let mut sums = Vec::with_capacity(orders.len());
+    let mut idxs = vec![0usize; cfg.num_sections];
+    let mut sums = Vec::with_capacity(requests.len());
 
-    for order in orders {
-        let idx = idxs[order.section];
-        sums.push(vec_of_sums[order.section][idx]);
-        idxs[order.section] += 1;
+    for rq in requests {
+        let idx = idxs[rq.section];
+        sums.push(vec_of_sums[rq.section][idx]);
+        idxs[rq.section] += 1;
     }
 
     sums
 }
 
-pub fn multi_thread(set: &'static [u8], orders: &[Order], cfg: Config) -> Vec<u8> {
-    let mut queues: Vec<Vec<usize>> = vec![Vec::default(); cfg.num_threads];
+pub fn multithreaded(set: &'static [u8], requests: &[Request], cfg: Config) -> Vec<u8> {
+    let mut queues: Vec<Vec<usize>> = vec![Vec::default(); cfg.num_sections];
 
-    for order in orders.iter() {
-        queues[order.section].push(order.prime);
+    for rq in requests {
+        queues[rq.section].push(rq.start);
     }
 
-    let mut handles = Vec::with_capacity(cfg.num_threads);
+    let mut handles = Vec::with_capacity(cfg.num_sections);
 
-    let mask = (cfg.num_bytes_per_thread.next_power_of_two() >> 1) - 1;
+    let mask = num_to_bitmask(cfg.num_bytes_per_section);
 
     for (i, queue) in queues.into_iter().enumerate() {
         handles.push(std::thread::spawn(move || {
-            let start = i * cfg.num_bytes_per_thread;
-            let end = start + cfg.num_bytes_per_thread;
+            let start = i * cfg.num_bytes_per_section;
+            let end = start + cfg.num_bytes_per_section;
 
             let pool_data_set = &set[start..end];
 
             let mut sums: Vec<u8> = Vec::with_capacity(queue.len());
 
             for prime in queue.into_iter() {
-                let sum = order_loop(pool_data_set, prime, mask);
+                let sum = handle_request(pool_data_set, prime, mask);
                 sums.push(sum);
             }
 
@@ -111,16 +138,16 @@ pub fn multi_thread(set: &'static [u8], orders: &[Order], cfg: Config) -> Vec<u8
         }));
     }
 
-    let mut vec_of_sums = Vec::with_capacity(cfg.num_threads);
+    let mut vec_of_sums = Vec::with_capacity(cfg.num_sections);
 
     for handle in handles.into_iter() {
         vec_of_sums.push(handle.join().unwrap());
     }
 
-    let mut idxs = vec![0usize; cfg.num_threads];
-    let mut sums = Vec::with_capacity(orders.len());
+    let mut idxs = vec![0usize; cfg.num_sections];
+    let mut sums = Vec::with_capacity(requests.len());
 
-    for order in orders {
+    for order in requests {
         let idx = idxs[order.section];
         sums.push(vec_of_sums[order.section][idx]);
         idxs[order.section] += 1;
@@ -129,94 +156,99 @@ pub fn multi_thread(set: &'static [u8], orders: &[Order], cfg: Config) -> Vec<u8
     sums
 }
 
-static PRIMES: [usize; 100] = [
-    2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97,
-    101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193,
-    197, 199, 211, 223, 227, 229, 233, 239, 241, 251, 257, 263, 269, 271, 277, 281, 283, 293, 307,
-    311, 313, 317, 331, 337, 347, 349, 353, 359, 367, 373, 379, 383, 389, 397, 401, 409, 419, 421,
-    431, 433, 439, 443, 449, 457, 461, 463, 467, 479, 487, 491, 499, 503, 509, 521, 523, 541,
-];
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn config() -> Config {
-    Config {
-        num_bytes_per_thread: 256 * (1 << 10),
-        num_threads: 4,
-        num_iterations: 100_000,
-    }
-}
+    static PRIMES: [usize; 100] = [
+        2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97,
+        101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193,
+        197, 199, 211, 223, 227, 229, 233, 239, 241, 251, 257, 263, 269, 271, 277, 281, 283, 293, 307,
+        311, 313, 317, 331, 337, 347, 349, 353, 359, 367, 373, 379, 383, 389, 397, 401, 409, 419, 421,
+        431, 433, 439, 443, 449, 457, 461, 463, 467, 479, 487, 491, 499, 503, 509, 521, 523, 541,
+    ];
 
-fn data_set() -> &'static [u8] {
-    use rand::prelude::*;
-    use rand_chacha::ChaCha8Rng;
-
-    let cfg = config();
-
-    let mut rng = ChaCha8Rng::seed_from_u64(0x1337);
-    let mut data_set = Vec::with_capacity(cfg.num_bytes_per_thread * cfg.num_threads);
-
-    for _ in 0..cfg.num_bytes_per_thread * cfg.num_threads {
-        data_set.push(rng.gen());
+    fn config() -> Config {
+        Config {
+            num_bytes_per_section: 256 * (1 << 10),
+            num_sections: 4,
+            num_iterations: 100_000,
+        }
     }
 
-    data_set.leak()
-}
+    fn data_set() -> &'static [u8] {
+        use rand::prelude::*;
+        use rand_chacha::ChaCha8Rng;
 
-fn orders() -> Vec<Order> {
-    use rand::prelude::*;
-    use rand_chacha::ChaCha8Rng;
+        let cfg = config();
 
-    let cfg = config();
+        let mut rng = ChaCha8Rng::seed_from_u64(0x1337);
+        let mut data_set = Vec::with_capacity(cfg.num_bytes_per_section * cfg.num_sections);
 
-    const NUM_ORDERS: usize = 1_000;
+        for _ in 0..cfg.num_bytes_per_section * cfg.num_sections {
+            data_set.push(rng.gen());
+        }
 
-    let mut rng = ChaCha8Rng::seed_from_u64(1337);
-    let mut orders = Vec::with_capacity(NUM_ORDERS);
-
-    for _ in 0..NUM_ORDERS {
-        let prime = PRIMES[rng.gen_range(0..100)] % cfg.num_bytes_per_thread;
-        let section = rng.gen_range(0..cfg.num_threads);
-
-        orders.push(Order { prime, section });
+        data_set.leak()
     }
 
-    orders
-}
+    fn orders() -> Vec<Request> {
+        use rand::prelude::*;
+        use rand_chacha::ChaCha8Rng;
 
-#[test]
-fn single() {
-    let start = std::time::SystemTime::now();
+        let cfg = config();
 
-    let set = data_set();
-    let orders = orders();
+        const NUM_ORDERS: usize = 1_000;
 
-    single_thread(set, &orders, config());
+        let mut rng = ChaCha8Rng::seed_from_u64(1337);
+        let mut orders = Vec::with_capacity(NUM_ORDERS);
 
-    let duration = start.elapsed().unwrap();
+        for _ in 0..NUM_ORDERS {
+            let prime = PRIMES[rng.gen_range(0..100)] % cfg.num_bytes_per_section;
+            let section = rng.gen_range(0..cfg.num_sections);
 
-    println!("Took: {}s", duration.as_secs_f32());
-}
+            orders.push(Request { prime, section });
+        }
 
-#[test]
-fn multi() {
-    let start = std::time::SystemTime::now();
+        orders
+    }
 
-    let set = data_set();
-    let orders = orders();
+    #[test]
+    fn single() {
+        let start = std::time::SystemTime::now();
 
-    multi_thread(set, &orders, config());
+        let set = data_set();
+        let orders = orders();
 
-    let duration = start.elapsed().unwrap();
+        singlethreaded(set, &orders, config());
 
-    println!("Took: {}s", duration.as_secs_f32());
-}
+        let duration = start.elapsed().unwrap();
 
-#[test]
-fn equality() {
-    let set = data_set();
-    let orders = orders();
+        println!("Took: {}s", duration.as_secs_f32());
+    }
 
-    let single = single_thread(set, &orders, config());
-    let multi = multi_thread(set, &orders, config());
+    #[test]
+    fn multi() {
+        let start = std::time::SystemTime::now();
 
-    assert_eq!(single, multi);
+        let set = data_set();
+        let orders = orders();
+
+        multithreaded(set, &orders, config());
+
+        let duration = start.elapsed().unwrap();
+
+        println!("Took: {}s", duration.as_secs_f32());
+    }
+
+    #[test]
+    fn equality() {
+        let set = data_set();
+        let orders = orders();
+
+        let single = singlethreaded(set, &orders, config());
+        let multi = multithreaded(set, &orders, config());
+
+        assert_eq!(single, multi);
+    }
 }

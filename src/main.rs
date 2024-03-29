@@ -1,79 +1,103 @@
-use amdahls_lie::{Config, Order};
+use amdahls_lie::{Config, Request};
 
-static PRIMES: [usize; 100] = [
-    2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97,
-    101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193,
-    197, 199, 211, 223, 227, 229, 233, 239, 241, 251, 257, 263, 269, 271, 277, 281, 283, 293, 307,
-    311, 313, 317, 331, 337, 347, 349, 353, 359, 367, 373, 379, 383, 389, 397, 401, 409, 419, 421,
-    431, 433, 439, 443, 449, 457, 461, 463, 467, 479, 487, 491, 499, 503, 509, 521, 523, 541,
-];
+struct Args {
+    subtask: String,
+    cfg: Config,
+    num_requests: usize,
+    seed: u64,
+}
 
-fn take_args() -> Option<(String, Config, usize)> {
+fn take_args() -> Result<Args, String> {
     let mut args = std::env::args();
 
     args.next().unwrap();
 
-    let subtask = args.next()?;
-    let num_bytes_per_thread: usize = args.next()?.parse().expect("Invalid num_bytes_per_thread");
-    let num_threads: usize = args.next()?.parse().expect("Invalid num_threads");
-    let num_iterations: usize = args.next()?.parse().expect("Invalid num_iterations"); 
-    let num_orders: usize = args.next()?.parse().expect("Invalid num_orders"); 
+    let subtask = args.next().ok_or("No subtask given".to_string())?;
+    let num_bytes_per_section = args
+        .next()
+        .ok_or("No num_bytes_per_thread given".to_string())?;
+    let num_sections = args.next().ok_or("No num_threads given".to_string())?;
+    let num_requests = args.next().ok_or("No num_orders given".to_string())?;
+    let seed = args.next().ok_or("No seed given".to_string())?;
 
-    let config = Config {
-        num_bytes_per_thread,
-        num_threads,
-        num_iterations,
+    let num_bytes_per_section: usize = num_bytes_per_section
+        .parse()
+        .map_err(|_| "Invalid num_bytes_per_thread")?;
+    let num_sections: usize = num_sections.parse().map_err(|_| "Invalid num_threads")?;
+    let num_requests: usize = num_requests.parse().map_err(|_| "Invalid num_orders")?;
+    let seed: u64 = seed.parse().map_err(|_| "Invalid seed")?;
+
+    let cfg = Config {
+        num_bytes_per_section,
+        num_sections,
     };
 
-    Some((subtask, config, num_orders))
+    Ok(Args {
+        subtask,
+        cfg,
+        num_requests,
+        seed,
+    })
 }
 
 fn main() {
     use rand::prelude::*;
     use rand_chacha::ChaCha8Rng;
 
-    let Some((subtask, config, num_orders)) = take_args() else {
-        eprintln!("Usage: amdahls_lie <single/multi> <num_bytes_per_thread> <num_threads> <num_iterations> <num_orders>");
+    let args = take_args().unwrap_or_else(|err| {
+        eprintln!("Usage: amdahls_lie <single/multi/batch> <num_bytes_per_section> <num_sections> <num_requests> <seed>");
+        eprintln!("- `single`: Single-Threaded with requests handled in-order");
+        eprintln!("- `multi`:  Multi-Threaded (one thread per section)");
+        eprintln!("- `batch`:  Single-Threaded with requests batched by section");
+        eprintln!("");
+        eprintln!("{err}");
         std::process::exit(2);
-    };
+    });
 
-    let mut rng = ChaCha8Rng::seed_from_u64(0x1337);
-    let mut data_set = Vec::with_capacity(config.num_bytes_per_thread * config.num_threads);
-    let mut orders = Vec::with_capacity(num_orders);
+    let Args {
+        subtask,
+        cfg,
+        num_requests,
+        seed,
+    } = args;
 
-    for _ in 0..config.total_bytes() {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut data_set = Vec::with_capacity(cfg.total_bytes());
+    let mut requests = Vec::with_capacity(num_requests);
+
+    for _ in 0..cfg.total_bytes() {
         data_set.push(rng.gen());
     }
 
-    for _ in 0..num_orders {
-        let prime = PRIMES[rng.gen_range(0..100)] % config.num_bytes_per_thread;
-        let section = rng.gen_range(0..config.num_threads);
+    for _ in 0..num_requests {
+        let start = rng.gen();
+        let section = rng.gen_range(0..cfg.num_sections);
 
-        orders.push(Order { prime, section });
+        requests.push(Request { start, section });
     }
 
     let set = data_set.leak();
-    let orders = &orders;
+    let requests = &requests;
 
     let start = std::time::SystemTime::now();
 
     match &subtask[..] {
         "single" => {
-            amdahls_lie::single_thread(set, orders, config);
+            amdahls_lie::singlethreaded(set, requests, cfg);
         }
         "batch" => {
-            amdahls_lie::batched_thread(set, orders, config);
+            amdahls_lie::singlethreaded_batched(set, requests, cfg);
         }
         "multi" => {
-            amdahls_lie::multi_thread(set, orders, config);
+            amdahls_lie::multithreaded(set, requests, cfg);
         }
         _ => {
             eprintln!("Invalid Task: '{subtask}'!");
-            std::process::exit(1);
+            std::process::exit(2);
         }
     }
 
     let duration = start.elapsed().unwrap();
 
-    println!("Took: {}s", duration.as_secs_f32());
+    println!("{}", duration.as_secs_f32());
 }
