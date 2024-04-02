@@ -1,4 +1,4 @@
-# Amdahl's Lie - Speed up parallel code beyond Amdahl's Law
+# Amdahl's Lie - Speeding up code beyond the theoretical limit
 
 This repository provides a proof-of-concept that shows how to break Amdahl's Law using caches. This tries to show that `n`-threaded applications can be more than `n` times as fast. This works for applications that can partition their work into memory slices.
 
