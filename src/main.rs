@@ -30,6 +30,7 @@ fn take_args() -> Result<Args, String> {
     let cfg = Config {
         num_bytes_per_section,
         num_sections,
+        num_iterations: 0x100,
     };
 
     Ok(Args {

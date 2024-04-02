@@ -2,6 +2,7 @@
 pub struct Config {
     pub num_bytes_per_section: usize,
     pub num_sections: usize,
+    pub num_iterations: usize,
 }
 
 pub struct Request {
@@ -16,14 +17,13 @@ impl Config {
 }
 
 #[inline(never)]
-fn handle_request(set: &[u8], start: usize, mask: usize) -> u8 {
+fn handle_request(set: &[u8], start: usize, mask: usize, num_iterations: usize) -> u8 {
     let mut offset = start;
     let mut sum = 0u8;
 
-    const ITERATIONS: usize = 0x100;
     const LOAD_SPACING: usize = 0x200;
 
-    for _ in 0..ITERATIONS {
+    for _ in 0..num_iterations {
         // Two Notes:
         // 1. We load here multiple times to increase the memory burden per loop. Especially with
         //    the multiplication. This is important.
@@ -71,7 +71,7 @@ pub fn singlethreaded(set: &'static [u8], requests: &[Request], cfg: Config) -> 
     for rq in requests {
         let start = rq.start;
         let section_start = rq.section * cfg.num_bytes_per_section;
-        let sum = handle_request(&set[section_start..], start, mask);
+        let sum = handle_request(&set[section_start..], start, mask, cfg.num_iterations);
         sums.push(sum);
     }
 
@@ -92,7 +92,7 @@ pub fn singlethreaded_batched(set: &'static [u8], requests: &[Request], cfg: Con
 
             let start = rq.start;
             let section_start = rq.section * cfg.num_bytes_per_section;
-            let sum = handle_request(&set[section_start..], start, mask);
+            let sum = handle_request(&set[section_start..], start, mask, cfg.num_iterations);
             vec_of_sums[thread].push(sum);
         }
     }
@@ -130,7 +130,7 @@ pub fn multithreaded(set: &'static [u8], requests: &[Request], cfg: Config) -> V
             let mut sums: Vec<u8> = Vec::with_capacity(queue.len());
 
             for prime in queue.into_iter() {
-                let sum = handle_request(pool_data_set, prime, mask);
+                let sum = handle_request(pool_data_set, prime, mask, cfg.num_iterations);
                 sums.push(sum);
             }
 
@@ -204,10 +204,10 @@ mod tests {
         let mut orders = Vec::with_capacity(NUM_ORDERS);
 
         for _ in 0..NUM_ORDERS {
-            let prime = PRIMES[rng.gen_range(0..100)] % cfg.num_bytes_per_section;
+            let start = PRIMES[rng.gen_range(0..100)] % cfg.num_bytes_per_section;
             let section = rng.gen_range(0..cfg.num_sections);
 
-            orders.push(Request { prime, section });
+            orders.push(Request { start, section });
         }
 
         orders
